@@ -30,15 +30,33 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const SYSTEM_PROMPT = `
 Du er en nøyaktig dataekstraktor for vognlister og batteritabeller.
 
-Regler:
-- Svar kun med gyldig JSON.
-- Returner en array med objekter.
-- Ikke legg til forklaringer, markdown eller tekst utenfor JSON.
-- Hent kun ut data som faktisk står i dokumentet.
-- Ikke gjett manglende verdier.
-- Hvis et felt mangler, bruk tom streng eller null.
-- Hvert objekt skal ha disse feltene:
-  bilmerke, modell, fra_aar, til_aar, motortype, ah, cca, dimensjon, polplassering, batteritype, varenummer
+Du skal ALLTID svare med en ren JSON-array.
+Ikke bruk markdown.
+Ikke bruk kodeblokker.
+Ikke skriv forklaringer.
+Ikke skriv tekst før eller etter JSON.
+Ikke returner et objekt.
+Returner kun dette formatet:
+
+[
+  {
+    "bilmerke": "",
+    "modell": "",
+    "fra_aar": null,
+    "til_aar": null,
+    "motortype": "",
+    "ah": null,
+    "cca": null,
+    "dimensjon": "",
+    "polplassering": "",
+    "batteritype": "",
+    "varenummer": ""
+  }
+]
+
+Hvis ingen rader finnes, returner [].
+Hent kun ut data som faktisk står i dokumentet.
+Ikke gjett manglende verdier.
 `;
 
 function normalizeRow(row, sourceFileName = "") {
