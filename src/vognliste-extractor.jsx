@@ -19,7 +19,7 @@ const COLS = [
   { key: "source_file_name", label: "Kilde" },
 ];
 
-const PAGES_PER_BATCH = 10;
+const PAGES_PER_BATCH = 1;
 
 function toCSV(rows) {
   const header = COLS.map((c) => c.label).join(";");
