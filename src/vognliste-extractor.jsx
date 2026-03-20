@@ -207,9 +207,31 @@ export default function VognlisteExtractor() {
       setErrorMsg("");
       setSuccessMsg("");
 
-      const resp = await fetch("/api/rows", {
-        method: "DELETE",
-      });
+      const resp = await fetch("/api/extract", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  signal: controller.signal,
+  body: JSON.stringify({
+    b64,
+    instruction,
+    sourceFileName: file.name,
+  }),
+});
+
+const raw = await resp.text();
+
+let data;
+try {
+  data = JSON.parse(raw);
+} catch {
+  throw new Error(`Serveren svarte ikke med JSON. Svar startet med: ${raw.slice(0, 300)}`);
+}
+
+if (!resp.ok) {
+  throw new Error(data?.error || `Ekstrahering feilet (${resp.status})`);
+}
 
       const data = await resp.json();
 
