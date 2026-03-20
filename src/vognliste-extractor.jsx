@@ -17,25 +17,37 @@ const COLS = [
   { key: "batteritype", label: "Type" },
   { key: "varenummer", label: "Varenr." },
   { key: "source_file_name", label: "Kilde" },
+  { key: "page_number", label: "Side" },
+  { key: "validation_status", label: "Status" },
+  { key: "validation_errors", label: "Feil" },
 ];
 
 const PAGES_PER_BATCH = 1;
 
 function toCSV(rows) {
   const header = COLS.map((c) => c.label).join(";");
+
   const lines = rows.map((r) =>
     COLS.map((c) => {
-      const value = r?.[c.key] ?? "";
+      let value = r?.[c.key] ?? "";
+
+      if (Array.isArray(value)) {
+        value = value.join(" | ");
+      } else if (typeof value === "object" && value !== null) {
+        value = JSON.stringify(value);
+      }
+
       const text = String(value).replace(/"/g, '""');
       return text.includes(";") || text.includes('"') || text.includes("\n")
         ? `"${text}"`
         : text;
     }).join(";")
   );
+
   return [header, ...lines].join("\n");
 }
 
-function downloadCSV(rows, filename = "battery_rows.csv") {
+function downloadCSV(rows, filename = "battery_rows_staging.csv") {
   const csv = "\uFEFF" + toCSV(rows);
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
@@ -50,6 +62,7 @@ function downloadCSV(rows, filename = "battery_rows.csv") {
 
 function normalizeRow(row) {
   return {
+    id: row?.id ?? null,
     bilmerke: row?.bilmerke ?? "",
     modell: row?.modell ?? "",
     fra_aar: row?.fra_aar ?? null,
@@ -62,6 +75,15 @@ function normalizeRow(row) {
     batteritype: row?.batteritype ?? "",
     varenummer: row?.varenummer ?? "",
     source_file_name: row?.source_file_name ?? "",
+    page_number: row?.page_number ?? null,
+    validation_status: row?.validation_status ?? "",
+    validation_errors: Array.isArray(row?.validation_errors)
+      ? row.validation_errors
+      : row?.validation_errors ?? [],
+    raw_model_output: row?.raw_model_output ?? "",
+    fingerprint: row?.fingerprint ?? "",
+    created_at: row?.created_at ?? "",
+    updated_at: row?.updated_at ?? "",
   };
 }
 
@@ -71,20 +93,23 @@ function dedupeRows(rows) {
 
   for (const row of rows) {
     const normalized = normalizeRow(row);
-    const key = [
-      normalized.bilmerke,
-      normalized.modell,
-      normalized.fra_aar,
-      normalized.til_aar,
-      normalized.motortype,
-      normalized.ah,
-      normalized.cca,
-      normalized.dimensjon,
-      normalized.polplassering,
-      normalized.batteritype,
-      normalized.varenummer,
-      normalized.source_file_name,
-    ].join("|");
+    const key =
+      normalized.fingerprint ||
+      [
+        normalized.bilmerke,
+        normalized.modell,
+        normalized.fra_aar,
+        normalized.til_aar,
+        normalized.motortype,
+        normalized.ah,
+        normalized.cca,
+        normalized.dimensjon,
+        normalized.polplassering,
+        normalized.batteritype,
+        normalized.varenummer,
+        normalized.source_file_name,
+        normalized.page_number,
+      ].join("|");
 
     if (!seen.has(key)) {
       seen.add(key);
@@ -120,7 +145,7 @@ async function parseJsonResponse(resp, fallbackPrefix) {
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`${fallbackPrefix}. Svar startet med: ${raw.slice(0, 300)}`);
+    throw new Error(`${fallbackPrefix}. Svar startet med: ${raw.slice(0, 500)}`);
   }
 
   if (!resp.ok) {
@@ -128,6 +153,13 @@ async function parseJsonResponse(resp, fallbackPrefix) {
   }
 
   return data;
+}
+
+function renderValidationErrors(value) {
+  if (!value) return "";
+  if (Array.isArray(value)) return value.join(" | ");
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
 }
 
 export default function VognlisteExtractor() {
@@ -138,29 +170,37 @@ export default function VognlisteExtractor() {
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
   const [filter, setFilter] = useState("");
-  const [sortKey, setSortKey] = useState("bilmerke");
+  const [sortKey, setSortKey] = useState("id");
   const [sortDir, setSortDir] = useState("asc");
   const [append, setAppend] = useState(false);
-  const [dbCount, setDbCount] = useState(0);
   const [loadingDb, setLoadingDb] = useState(true);
   const [isCancelling, setIsCancelling] = useState(false);
 
   const inputRef = useRef(null);
   const abortRef = useRef(null);
 
+  const summary = useMemo(() => {
+    const valid = rows.filter((r) => r.validation_status === "valid").length;
+    const review = rows.filter((r) => r.validation_status !== "valid").length;
+    return {
+      total: rows.length,
+      valid,
+      review,
+    };
+  }, [rows]);
+
   const loadRowsFromDatabase = useCallback(async () => {
     try {
       setLoadingDb(true);
       setErrorMsg("");
 
-      const resp = await fetch("/api/rows");
-      const data = await parseJsonResponse(resp, "Databasekallet svarte ikke med JSON");
+      const resp = await fetch("/api/staging-rows");
+      const data = await parseJsonResponse(resp, "Staging-kallet svarte ikke med JSON");
 
       const incomingRows = Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
-      setRows(incomingRows);
-      setDbCount(incomingRows.length);
+      setRows(dedupeRows(incomingRows));
     } catch (err) {
-      setErrorMsg(err?.message || "Feil ved lasting fra database");
+      setErrorMsg(err?.message || "Feil ved lasting fra staging");
     } finally {
       setLoadingDb(false);
     }
@@ -192,47 +232,73 @@ export default function VognlisteExtractor() {
     setProgress("Avbryter prosess...");
   }, []);
 
-  const saveRowsToDatabase = useCallback(async (newRows, sourceFileName) => {
-    const resp = await fetch("/api/rows", {
+  const saveRowsToStaging = useCallback(async (newRows) => {
+    const resp = await fetch("/api/staging-rows", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         rows: newRows,
-        sourceFileName,
       }),
     });
 
-    const data = await parseJsonResponse(resp, "Lagring svarte ikke med JSON");
-    return Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
+    const data = await parseJsonResponse(resp, "Lagring til staging svarte ikke med JSON");
+    return {
+      rows: Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [],
+      validCount: data?.validCount ?? 0,
+      reviewCount: data?.reviewCount ?? 0,
+      insertedOrUpdated: data?.inserted_or_updated ?? 0,
+    };
   }, []);
 
-  const clearDatabase = useCallback(async () => {
-    const confirmed = window.confirm("Vil du slette alle rader fra Supabase?");
+  const clearStaging = useCallback(async () => {
+    const confirmed = window.confirm("Vil du slette alle rader fra staging-tabellen?");
     if (!confirmed) return;
 
     try {
       setStatus("loading");
-      setProgress("Tømmer database...");
+      setProgress("Tømmer staging...");
       setErrorMsg("");
       setSuccessMsg("");
 
-      const resp = await fetch("/api/rows", {
+      const resp = await fetch("/api/staging-rows", {
         method: "DELETE",
       });
 
       await parseJsonResponse(resp, "Sletting svarte ikke med JSON");
 
       setRows([]);
-      setDbCount(0);
       setStatus("done");
       setProgress("");
-      setSuccessMsg("Databasen er tømt.");
+      setSuccessMsg("Staging-tabellen er tømt.");
     } catch (err) {
       setStatus("error");
       setProgress("");
-      setErrorMsg(err?.message || "Feil ved tømming av database");
+      setErrorMsg(err?.message || "Feil ved tømming av staging");
+    }
+  }, []);
+
+  const promoteValidRows = useCallback(async () => {
+    try {
+      setStatus("loading");
+      setProgress("Flytter gyldige rader til final-tabell...");
+      setErrorMsg("");
+      setSuccessMsg("");
+
+      const resp = await fetch("/api/promote-valid-rows", {
+        method: "POST",
+      });
+
+      const data = await parseJsonResponse(resp, "Flytting svarte ikke med JSON");
+
+      setStatus("done");
+      setProgress("");
+      setSuccessMsg(`${data.promoted || 0} gyldige rader flyttet til final-tabell.`);
+    } catch (err) {
+      setStatus("error");
+      setProgress("");
+      setErrorMsg(err?.message || "Feil ved flytting til final-tabell");
     }
   }, []);
 
@@ -270,10 +336,14 @@ export default function VognlisteExtractor() {
         setProgress(`Ekstraherer side ${fromPage}–${toPage} av ${totalPages}...`);
 
         const instruction = `Ekstraher KUN oppføringene fra side ${fromPage} til og med side ${toPage}.
-Svar KUN med en JSON-array.
+Svar KUN med en komplett JSON-array.
+JSON må være gyldig og fullført.
+Ikke bruk markdown.
+Ikke bruk kodeblokker.
+Ikke inkluder forklaringstekst.
+Hvis ingen rader finnes, returner [].
 Hvert objekt skal ha feltene:
-bilmerke, modell, fra_aar, til_aar, motortype, ah, cca, dimensjon, polplassering, batteritype, varenummer.
-Ikke inkluder forklaringstekst.`;
+bilmerke, modell, fra_aar, til_aar, motortype, ah, cca, dimensjon, polplassering, batteritype, varenummer.`;
 
         const resp = await fetch("/api/extract", {
           method: "POST",
@@ -285,15 +355,21 @@ Ikke inkluder forklaringstekst.`;
             b64,
             instruction,
             sourceFileName: file.name,
+            pageNumber: fromPage,
           }),
         });
 
         const data = await parseJsonResponse(resp, "Serveren svarte ikke med JSON");
-
         const batchRows = Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
+
         extractedRows = dedupeRows([...extractedRows, ...batchRows]);
 
-        setRows((prev) => (append ? dedupeRows([...prev, ...batchRows]) : [...extractedRows]));
+        setRows((prev) => {
+          if (append) {
+            return dedupeRows([...prev, ...batchRows]);
+          }
+          return [...extractedRows];
+        });
       }
 
       if (extractedRows.length === 0) {
@@ -303,14 +379,17 @@ Ikke inkluder forklaringstekst.`;
         return;
       }
 
-      setProgress("Lagrer til database...");
-      await saveRowsToDatabase(extractedRows, file.name);
+      setProgress("Lagrer til staging...");
+      const stagingResult = await saveRowsToStaging(extractedRows);
 
       await loadRowsFromDatabase();
 
       setStatus("done");
       setProgress("");
-      setSuccessMsg(`${extractedRows.length} rader behandlet og lagret til Supabase.`);
+      setSuccessMsg(
+        `${stagingResult.insertedOrUpdated} rader lagret/oppdatert i staging. ` +
+          `${stagingResult.validCount} gyldige, ${stagingResult.reviewCount} til kontroll.`
+      );
     } catch (err) {
       if (err?.name === "AbortError") {
         setStatus("idle");
@@ -325,7 +404,7 @@ Ikke inkluder forklaringstekst.`;
       abortRef.current = null;
       setIsCancelling(false);
     }
-  }, [append, file, loadRowsFromDatabase, saveRowsToDatabase]);
+  }, [append, file, loadRowsFromDatabase, saveRowsToStaging]);
 
   const toggleSort = (key) => {
     if (sortKey === key) {
@@ -342,7 +421,12 @@ Ikke inkluder forklaringstekst.`;
     if (!q) return rows;
 
     return rows.filter((row) =>
-      Object.values(row).some((value) => String(value ?? "").toLowerCase().includes(q))
+      Object.values(row).some((value) => {
+        if (Array.isArray(value)) {
+          return value.join(" ").toLowerCase().includes(q);
+        }
+        return String(value ?? "").toLowerCase().includes(q);
+      })
     );
   }, [filter, rows]);
 
@@ -350,9 +434,13 @@ Ikke inkluder forklaringstekst.`;
     const copy = [...filteredRows];
 
     copy.sort((a, b) => {
-      const av = a?.[sortKey] ?? "";
-      const bv = b?.[sortKey] ?? "";
-      const result = String(av).localeCompare(String(bv), "nb", { numeric: true });
+      const av = a?.[sortKey];
+      const bv = b?.[sortKey];
+
+      const aVal = Array.isArray(av) ? av.join(" | ") : av ?? "";
+      const bVal = Array.isArray(bv) ? bv.join(" | ") : bv ?? "";
+
+      const result = String(aVal).localeCompare(String(bVal), "nb", { numeric: true });
       return sortDir === "asc" ? result : -result;
     });
 
@@ -457,6 +545,7 @@ Ikke inkluder forklaringstekst.`;
           display: "flex",
           alignItems: "center",
           gap: "12px",
+          flexWrap: "wrap",
         }}
       >
         <div style={{ fontSize: "22px" }}>🔋</div>
@@ -473,7 +562,7 @@ Ikke inkluder forklaringstekst.`;
             VOGNLISTE EKSTRAKTOR
           </div>
           <div style={{ fontSize: "11px", color: "#666", letterSpacing: ".1em" }}>
-            BATTERI DATABASE BUILDER — SUPABASE
+            STAGING + VALIDERING + FINAL
           </div>
         </div>
 
@@ -486,21 +575,20 @@ Ikke inkluder forklaringstekst.`;
             flexWrap: "wrap",
           }}
         >
-          <div
-            className="panel"
-            style={{
-              padding: "6px 12px",
-              color: "#aaa",
-              fontSize: "13px",
-            }}
-          >
-            Database: <span style={{ color: "#f5a623", fontWeight: 700 }}>{dbCount}</span> rader
+          <div className="panel" style={{ padding: "6px 12px", color: "#aaa", fontSize: "13px" }}>
+            Staging: <span style={{ color: "#f5a623", fontWeight: 700 }}>{summary.total}</span>
           </div>
-          {loadingDb && <div style={{ fontSize: "12px", color: "#777" }}>Laster database...</div>}
+          <div className="panel" style={{ padding: "6px 12px", color: "#aaa", fontSize: "13px" }}>
+            Valid: <span style={{ color: "#6ad17a", fontWeight: 700 }}>{summary.valid}</span>
+          </div>
+          <div className="panel" style={{ padding: "6px 12px", color: "#aaa", fontSize: "13px" }}>
+            Review: <span style={{ color: "#ff8d8d", fontWeight: 700 }}>{summary.review}</span>
+          </div>
+          {loadingDb && <div style={{ fontSize: "12px", color: "#777" }}>Laster staging...</div>}
         </div>
       </div>
 
-      <div style={{ padding: "24px", maxWidth: "1600px", margin: "0 auto" }}>
+      <div style={{ padding: "24px", maxWidth: "1800px", margin: "0 auto" }}>
         <div
           style={{
             display: "grid",
@@ -544,7 +632,7 @@ Ikke inkluder forklaringstekst.`;
                   Dra og slipp PDF her, eller klikk for å velge
                 </div>
                 <div style={{ fontSize: "11px", color: "#555", marginTop: "4px" }}>
-                  Scannede vognlister støttes
+                  Ekstrahering går side for side til staging
                 </div>
               </div>
             )}
@@ -556,7 +644,7 @@ Ikke inkluder forklaringstekst.`;
               disabled={!file || status === "loading"}
               onClick={extract}
             >
-              {status === "loading" ? "⏳ PROSESSERER..." : "▶ EKSTRAHER OG LAGRE"}
+              {status === "loading" ? "⏳ PROSESSERER..." : "▶ EKSTRAHER TIL STAGING"}
             </button>
 
             {status === "loading" && (
@@ -587,17 +675,25 @@ Ikke inkluder forklaringstekst.`;
                 onChange={(e) => setAppend(e.target.checked)}
                 style={{ accentColor: "#f5a623" }}
               />
-              Legg nye rader til eksisterende data
+              Vis nye rader sammen med eksisterende staging-data under kjøring
             </label>
+
+            <button
+              className="btn btn-secondary"
+              onClick={promoteValidRows}
+              disabled={status === "loading" || summary.valid === 0}
+            >
+              ✓ FLYTT GYLDIGE TIL FINAL
+            </button>
 
             {rows.length > 0 && (
               <button className="btn btn-secondary" onClick={() => downloadCSV(rows)}>
-                ⬇ LAST NED CSV
+                ⬇ LAST NED STAGING CSV
               </button>
             )}
 
-            <button className="btn btn-danger" onClick={clearDatabase} disabled={status === "loading"}>
-              🗑 TØM SUPABASE
+            <button className="btn btn-danger" onClick={clearStaging} disabled={status === "loading"}>
+              🗑 TØM STAGING
             </button>
           </div>
         </div>
@@ -711,6 +807,7 @@ Ikke inkluder forklaringstekst.`;
                           fontWeight: sortKey === c.key ? 600 : 400,
                           letterSpacing: ".06em",
                           fontSize: "11px",
+                          whiteSpace: "nowrap",
                         }}
                       >
                         {c.label} {sortKey === c.key ? (sortDir === "asc" ? "↑" : "↓") : ""}
@@ -719,37 +816,68 @@ Ikke inkluder forklaringstekst.`;
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedRows.map((r, i) => (
-                    <tr
-                      key={`${r.id ?? "row"}-${i}`}
-                      className="row-hover"
-                      style={{
-                        borderBottom: "1px solid #1e1e1e",
-                        background: i % 2 === 0 ? "#0f0f0f" : "#121212",
-                      }}
-                    >
-                      <td style={{ padding: "6px 10px", color: "#444", textAlign: "center" }}>
-                        {i + 1}
-                      </td>
-                      {COLS.map((c) => (
-                        <td
-                          key={c.key}
-                          style={{
-                            padding: "6px 10px",
-                            color:
-                              c.key === "bilmerke" || c.key === "modell"
-                                ? "#e8e0d0"
-                                : c.key === "ah" || c.key === "cca"
-                                  ? "#f5a623"
-                                  : "#aaa",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {r?.[c.key] ?? <span style={{ color: "#333" }}>—</span>}
+                  {sortedRows.map((r, i) => {
+                    const isValid = r.validation_status === "valid";
+                    return (
+                      <tr
+                        key={`${r.id ?? "row"}-${i}`}
+                        className="row-hover"
+                        style={{
+                          borderBottom: "1px solid #1e1e1e",
+                          background: i % 2 === 0 ? "#0f0f0f" : "#121212",
+                        }}
+                      >
+                        <td style={{ padding: "6px 10px", color: "#444", textAlign: "center" }}>
+                          {i + 1}
                         </td>
-                      ))}
-                    </tr>
-                  ))}
+
+                        {COLS.map((c) => {
+                          let displayValue = r?.[c.key];
+
+                          if (c.key === "validation_errors") {
+                            displayValue = renderValidationErrors(displayValue);
+                          }
+
+                          if (c.key === "validation_status") {
+                            return (
+                              <td
+                                key={c.key}
+                                style={{
+                                  padding: "6px 10px",
+                                  whiteSpace: "nowrap",
+                                  color: isValid ? "#6ad17a" : "#ff8d8d",
+                                  fontWeight: 600,
+                                }}
+                              >
+                                {displayValue || "—"}
+                              </td>
+                            );
+                          }
+
+                          return (
+                            <td
+                              key={c.key}
+                              style={{
+                                padding: "6px 10px",
+                                color:
+                                  c.key === "bilmerke" || c.key === "modell"
+                                    ? "#e8e0d0"
+                                    : c.key === "ah" || c.key === "cca"
+                                      ? "#f5a623"
+                                      : c.key === "validation_errors"
+                                        ? "#ff8d8d"
+                                        : "#aaa",
+                                whiteSpace: c.key === "validation_errors" ? "normal" : "nowrap",
+                                maxWidth: c.key === "validation_errors" ? "320px" : "none",
+                              }}
+                            >
+                              {displayValue || <span style={{ color: "#333" }}>—</span>}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -760,7 +888,7 @@ Ikke inkluder forklaringstekst.`;
           <div style={{ textAlign: "center", padding: "60px 20px", color: "#333" }}>
             <div style={{ fontSize: "48px", marginBottom: "12px", opacity: 0.3 }}>🔋</div>
             <div style={{ fontSize: "13px", letterSpacing: ".1em" }}>
-              INGEN DATA ENNÅ — LAST OPP EN VOGNLISTE PDF
+              INGEN STAGING-DATA ENNÅ — LAST OPP EN VOGNLISTE PDF
             </div>
           </div>
         )}
