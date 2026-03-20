@@ -366,8 +366,27 @@ app.post("/api/staging-rows", async (req, res) => {
       return res.status(400).json({ error: "rows må være en array" });
     }
 
-    const prepared = rows.map((row) => {
+    const prepared = rows.map((incomingRow) => {
+      const row = {
+        bilmerke: incomingRow?.bilmerke ?? "",
+        modell: incomingRow?.modell ?? "",
+        fra_aar: incomingRow?.fra_aar ?? null,
+        til_aar: incomingRow?.til_aar ?? null,
+        motortype: incomingRow?.motortype ?? "",
+        ah: incomingRow?.ah ?? null,
+        cca: incomingRow?.cca ?? null,
+        dimensjon: incomingRow?.dimensjon ?? "",
+        polplassering: incomingRow?.polplassering ?? "",
+        batteritype: incomingRow?.batteritype ?? "",
+        varenummer: incomingRow?.varenummer ?? "",
+        source_file_name: incomingRow?.source_file_name ?? "",
+        page_number: incomingRow?.page_number ?? null,
+        raw_model_output: incomingRow?.raw_model_output ?? "",
+        fingerprint: incomingRow?.fingerprint ?? "",
+      };
+
       const validated = validateRow(row);
+
       return {
         ...row,
         validation_status: validated.validation_status,
