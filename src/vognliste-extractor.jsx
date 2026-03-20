@@ -3,6 +3,7 @@ import * as pdfjsLib from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
 const COLS = [
   { key: "bilmerke", label: "Bilmerke" },
   { key: "modell", label: "Modell" },
@@ -112,6 +113,23 @@ async function getPdfPageCount(file) {
   return pdf.numPages;
 }
 
+async function parseJsonResponse(resp, fallbackPrefix) {
+  const raw = await resp.text();
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`${fallbackPrefix}. Svar startet med: ${raw.slice(0, 300)}`);
+  }
+
+  if (!resp.ok) {
+    throw new Error(data?.error || `${fallbackPrefix} (${resp.status})`);
+  }
+
+  return data;
+}
+
 export default function VognlisteExtractor() {
   const [file, setFile] = useState(null);
   const [rows, setRows] = useState([]);
@@ -133,12 +151,10 @@ export default function VognlisteExtractor() {
   const loadRowsFromDatabase = useCallback(async () => {
     try {
       setLoadingDb(true);
-      const resp = await fetch("/api/rows");
-      const data = await resp.json();
+      setErrorMsg("");
 
-      if (!resp.ok) {
-        throw new Error(data?.error || `Klarte ikke å hente rader (${resp.status})`);
-      }
+      const resp = await fetch("/api/rows");
+      const data = await parseJsonResponse(resp, "Databasekallet svarte ikke med JSON");
 
       const incomingRows = Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
       setRows(incomingRows);
@@ -188,12 +204,7 @@ export default function VognlisteExtractor() {
       }),
     });
 
-    const data = await resp.json();
-
-    if (!resp.ok) {
-      throw new Error(data?.error || `Klarte ikke å lagre rader (${resp.status})`);
-    }
-
+    const data = await parseJsonResponse(resp, "Lagring svarte ikke med JSON");
     return Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
   }, []);
 
@@ -207,37 +218,11 @@ export default function VognlisteExtractor() {
       setErrorMsg("");
       setSuccessMsg("");
 
-      const resp = await fetch("/api/extract", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-  },
-  signal: controller.signal,
-  body: JSON.stringify({
-    b64,
-    instruction,
-    sourceFileName: file.name,
-  }),
-});
+      const resp = await fetch("/api/rows", {
+        method: "DELETE",
+      });
 
-const raw = await resp.text();
-
-let data;
-try {
-  data = JSON.parse(raw);
-} catch {
-  throw new Error(`Serveren svarte ikke med JSON. Svar startet med: ${raw.slice(0, 300)}`);
-}
-
-if (!resp.ok) {
-  throw new Error(data?.error || `Ekstrahering feilet (${resp.status})`);
-}
-
-      const data = await resp.json();
-
-      if (!resp.ok) {
-        throw new Error(data?.error || `Klarte ikke å tømme database (${resp.status})`);
-      }
+      await parseJsonResponse(resp, "Sletting svarte ikke med JSON");
 
       setRows([]);
       setDbCount(0);
@@ -246,6 +231,7 @@ if (!resp.ok) {
       setSuccessMsg("Databasen er tømt.");
     } catch (err) {
       setStatus("error");
+      setProgress("");
       setErrorMsg(err?.message || "Feil ved tømming av database");
     }
   }, []);
@@ -302,21 +288,11 @@ Ikke inkluder forklaringstekst.`;
           }),
         });
 
-        const raw = await resp.text();
-
-let data;
-try {
-  data = JSON.parse(raw);
-} catch {
-  throw new Error(`Lagring svarte ikke med JSON. Svar startet med: ${raw.slice(0, 300)}`);
-}
-
-        if (!resp.ok) {
-          throw new Error(data?.error || `Ekstrahering feilet (${resp.status})`);
-        }
+        const data = await parseJsonResponse(resp, "Serveren svarte ikke med JSON");
 
         const batchRows = Array.isArray(data?.rows) ? data.rows.map(normalizeRow) : [];
         extractedRows = dedupeRows([...extractedRows, ...batchRows]);
+
         setRows((prev) => (append ? dedupeRows([...prev, ...batchRows]) : [...extractedRows]));
       }
 
@@ -328,23 +304,13 @@ try {
       }
 
       setProgress("Lagrer til database...");
-      const savedRows = await saveRowsToDatabase(extractedRows, file.name);
+      await saveRowsToDatabase(extractedRows, file.name);
 
-      if (append) {
-        setRows((prev) => dedupeRows([...prev, ...savedRows]));
-      } else {
-        await loadRowsFromDatabase();
-      }
+      await loadRowsFromDatabase();
 
-      const finalCount = append
-        ? dedupeRows([...(append ? rows : []), ...savedRows]).length
-        : null;
-
-      setDbCount((current) => (append ? Math.max(current, finalCount ?? current) : savedRows.length || current));
       setStatus("done");
       setProgress("");
-      setSuccessMsg(`${savedRows.length} rader lagret til Supabase.`);
-      await loadRowsFromDatabase();
+      setSuccessMsg(`${extractedRows.length} rader behandlet og lagret til Supabase.`);
     } catch (err) {
       if (err?.name === "AbortError") {
         setStatus("idle");
@@ -359,7 +325,7 @@ try {
       abortRef.current = null;
       setIsCancelling(false);
     }
-  }, [append, file, loadRowsFromDatabase, rows, saveRowsToDatabase]);
+  }, [append, file, loadRowsFromDatabase, saveRowsToDatabase]);
 
   const toggleSort = (key) => {
     if (sortKey === key) {
@@ -679,6 +645,8 @@ try {
               marginBottom: "16px",
               fontSize: "13px",
               color: "#f44336",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
             }}
           >
             ✗ {errorMsg}
