@@ -35,26 +35,12 @@ Returner kun [] hvis ingen rader finnes.
 Hvert objekt skal ha disse feltene:
 bilmerke, modell, fra_aar, til_aar, motortype, ah, cca, dimensjon, polplassering, batteritype, varenummer
 
-Hent kun ut data som faktisk står i dokumentet.
-Ikke gjett manglende verdier.
+Regler:
+- Hent kun ut data som faktisk står i dokumentet.
+- Ikke gjett manglende verdier.
+- Hvis et felt mangler, bruk null eller tom streng.
+- En rad per faktisk tabellrad.
 `;
-
-function makeFingerprint(row) {
-  return [
-    row?.bilmerke ?? "",
-    row?.modell ?? "",
-    row?.fra_aar ?? "",
-    row?.til_aar ?? "",
-    row?.motortype ?? "",
-    row?.ah ?? "",
-    row?.cca ?? "",
-    row?.dimensjon ?? "",
-    row?.polplassering ?? "",
-    row?.batteritype ?? "",
-    row?.varenummer ?? "",
-    row?.source_file_name ?? "",
-  ].join("|");
-}
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -62,25 +48,90 @@ function normalizeNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function normalizeRow(row, sourceFileName = "") {
+function cleanText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function makeFingerprint(row) {
+  return [
+    row.bilmerke,
+    row.modell,
+    row.fra_aar ?? "",
+    row.til_aar ?? "",
+    row.motortype,
+    row.ah ?? "",
+    row.cca ?? "",
+    row.dimensjon,
+    row.polplassering,
+    row.batteritype,
+    row.varenummer,
+    row.source_file_name,
+    row.page_number ?? "",
+  ].join("|");
+}
+
+function normalizeRow(row, sourceFileName = "", pageNumber = null, rawModelOutput = "") {
   const normalized = {
-    bilmerke: row?.bilmerke ?? "",
-    modell: row?.modell ?? "",
+    bilmerke: cleanText(row?.bilmerke),
+    modell: cleanText(row?.modell),
     fra_aar: normalizeNumber(row?.fra_aar),
     til_aar: normalizeNumber(row?.til_aar),
-    motortype: row?.motortype ?? "",
+    motortype: cleanText(row?.motortype),
     ah: normalizeNumber(row?.ah),
     cca: normalizeNumber(row?.cca),
-    dimensjon: row?.dimensjon ?? "",
-    polplassering: row?.polplassering ?? "",
-    batteritype: row?.batteritype ?? "",
-    varenummer: row?.varenummer ?? "",
-    source_file_name: sourceFileName ?? "",
+    dimensjon: cleanText(row?.dimensjon),
+    polplassering: cleanText(row?.polplassering),
+    batteritype: cleanText(row?.batteritype),
+    varenummer: cleanText(row?.varenummer),
+    source_file_name: cleanText(sourceFileName),
+    page_number: pageNumber,
+    raw_model_output: rawModelOutput || "",
   };
 
   return {
     ...normalized,
     fingerprint: makeFingerprint(normalized),
+  };
+}
+
+function validateRow(row) {
+  const errors = [];
+
+  if (!row.bilmerke) errors.push("Mangler bilmerke");
+  if (!row.modell) errors.push("Mangler modell");
+
+  if (row.fra_aar !== null && (row.fra_aar < 1950 || row.fra_aar > 2100)) {
+    errors.push("Ugyldig fra_aar");
+  }
+
+  if (row.til_aar !== null && (row.til_aar < 1950 || row.til_aar > 2100)) {
+    errors.push("Ugyldig til_aar");
+  }
+
+  if (
+    row.fra_aar !== null &&
+    row.til_aar !== null &&
+    row.til_aar < row.fra_aar
+  ) {
+    errors.push("til_aar er mindre enn fra_aar");
+  }
+
+  if (row.ah !== null && (row.ah < 1 || row.ah > 400)) {
+    errors.push("Ugyldig Ah");
+  }
+
+  if (row.cca !== null && (row.cca < 1 || row.cca > 3000)) {
+    errors.push("Ugyldig CCA");
+  }
+
+  if (!row.varenummer) {
+    errors.push("Mangler varenummer");
+  }
+
+  return {
+    validation_status: errors.length === 0 ? "valid" : "needs_review",
+    validation_errors: errors,
   };
 }
 
@@ -113,16 +164,6 @@ function tryParseJSONArray(text) {
     } catch {}
   }
 
-  const objStart = cleaned.indexOf("{");
-  const objEnd = cleaned.lastIndexOf("}");
-  if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
-    const candidate = cleaned.slice(objStart, objEnd + 1);
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed && Array.isArray(parsed.rows)) return parsed.rows;
-    } catch {}
-  }
-
   throw new Error(`Klarte ikke å parse JSON-array fra modellen. Råsvar: ${raw.slice(0, 1200)}`);
 }
 
@@ -139,10 +180,10 @@ app.get("/api/health", (_req, res) => {
   return res.json({ ok: true });
 });
 
-app.get("/api/rows", async (_req, res) => {
+app.get("/api/staging-rows", async (_req, res) => {
   try {
     const { data, error } = await supabase
-      .from("battery_rows")
+      .from("battery_rows_staging")
       .select("*")
       .order("id", { ascending: true });
 
@@ -153,49 +194,34 @@ app.get("/api/rows", async (_req, res) => {
     return res.json({ rows: data || [] });
   } catch (error) {
     return res.status(500).json({
-      error: error?.message || "Feil ved henting av rader",
+      error: error?.message || "Feil ved henting av staging-rader",
     });
   }
 });
 
-app.post("/api/rows", async (req, res) => {
+app.get("/api/final-rows", async (_req, res) => {
   try {
-    const { rows, sourceFileName } = req.body;
-
-    if (!Array.isArray(rows)) {
-      return res.status(400).json({ error: "rows må være en array" });
-    }
-
-    const normalized = rows.map((r) => normalizeRow(r, sourceFileName));
-
-    if (normalized.length === 0) {
-      return res.json({ inserted: 0, rows: [] });
-    }
-
     const { data, error } = await supabase
-      .from("battery_rows")
-      .insert(normalized)
-      .select("*");
+      .from("battery_rows_final")
+      .select("*")
+      .order("id", { ascending: true });
 
     if (error) {
       return res.status(500).json({ error: error.message });
     }
 
-    return res.json({
-      inserted: data?.length || 0,
-      rows: data || [],
-    });
+    return res.json({ rows: data || [] });
   } catch (error) {
     return res.status(500).json({
-      error: error?.message || "Feil ved lagring av rader",
+      error: error?.message || "Feil ved henting av endelige rader",
     });
   }
 });
 
-app.delete("/api/rows", async (_req, res) => {
+app.delete("/api/staging-rows", async (_req, res) => {
   try {
     const { error } = await supabase
-      .from("battery_rows")
+      .from("battery_rows_staging")
       .delete()
       .not("id", "is", null);
 
@@ -206,26 +232,37 @@ app.delete("/api/rows", async (_req, res) => {
     return res.json({ ok: true });
   } catch (error) {
     return res.status(500).json({
-      error: error?.message || "Feil ved sletting av rader",
+      error: error?.message || "Feil ved sletting av staging-rader",
+    });
+  }
+});
+
+app.delete("/api/final-rows", async (_req, res) => {
+  try {
+    const { error } = await supabase
+      .from("battery_rows_final")
+      .delete()
+      .not("id", "is", null);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Feil ved sletting av final-rader",
     });
   }
 });
 
 app.post("/api/extract", async (req, res) => {
-  const startedAt = Date.now();
-
   try {
-    const { b64, instruction, sourceFileName } = req.body;
+    const { b64, instruction, sourceFileName, pageNumber } = req.body;
 
     if (!b64 || !instruction) {
       return res.status(400).json({ error: "Mangler b64 eller instruction" });
     }
-
-    console.log("[extract] Start", {
-      sourceFileName,
-      b64Length: b64.length,
-      instructionPreview: instruction.slice(0, 160),
-    });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 90000);
@@ -272,11 +309,6 @@ app.post("/api/extract", async (req, res) => {
     const { text: rawAnthropicText, json: anthropicJson } = await readResponseSafely(anthropicResp);
 
     if (!anthropicResp.ok) {
-      console.error("[extract] Anthropic error", {
-        status: anthropicResp.status,
-        bodyPreview: rawAnthropicText.slice(0, 1200),
-      });
-
       return res.status(anthropicResp.status).json({
         error:
           anthropicJson?.error?.message ||
@@ -286,7 +318,6 @@ app.post("/api/extract", async (req, res) => {
     }
 
     if (!anthropicJson) {
-      console.error("[extract] Anthropic svarte ikke med JSON", rawAnthropicText.slice(0, 1200));
       return res.status(500).json({
         error: "Anthropic svarte ikke med gyldig JSON",
         raw: rawAnthropicText.slice(0, 1200),
@@ -300,27 +331,21 @@ app.post("/api/extract", async (req, res) => {
     try {
       parsedRows = tryParseJSONArray(text);
     } catch (parseError) {
-      console.error("[extract] Parsefeil", parseError.message);
       return res.status(500).json({
         error: parseError.message,
         rawText: text.slice(0, 1200),
       });
     }
 
-    const rows = parsedRows.map((r) => normalizeRow(r, sourceFileName));
-
-    console.log("[extract] Ferdig", {
-      rowCount: rows.length,
-      ms: Date.now() - startedAt,
-    });
+    const rows = parsedRows.map((r) =>
+      normalizeRow(r, sourceFileName, pageNumber, text)
+    );
 
     return res.json({
       rows,
       rawText: text.slice(0, 1200),
     });
   } catch (error) {
-    console.error("[extract] Uventet feil", error);
-
     if (error?.name === "AbortError") {
       return res.status(504).json({
         error: "Kallet til Anthropic tok for lang tid og ble avbrutt",
@@ -329,6 +354,105 @@ app.post("/api/extract", async (req, res) => {
 
     return res.status(500).json({
       error: error?.message || "Ukjent serverfeil",
+    });
+  }
+});
+
+app.post("/api/staging-rows", async (req, res) => {
+  try {
+    const { rows } = req.body;
+
+    if (!Array.isArray(rows)) {
+      return res.status(400).json({ error: "rows må være en array" });
+    }
+
+    const prepared = rows.map((row) => {
+      const validated = validateRow(row);
+      return {
+        ...row,
+        validation_status: validated.validation_status,
+        validation_errors: validated.validation_errors,
+      };
+    });
+
+    if (prepared.length === 0) {
+      return res.json({ inserted: 0, updated: 0, rows: [] });
+    }
+
+    const { data, error } = await supabase
+      .from("battery_rows_staging")
+      .upsert(prepared, { onConflict: "fingerprint" })
+      .select("*");
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const validCount = prepared.filter((r) => r.validation_status === "valid").length;
+    const reviewCount = prepared.filter((r) => r.validation_status !== "valid").length;
+
+    return res.json({
+      inserted_or_updated: data?.length || 0,
+      validCount,
+      reviewCount,
+      rows: data || [],
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Feil ved lagring til staging",
+    });
+  }
+});
+
+app.post("/api/promote-valid-rows", async (_req, res) => {
+  try {
+    const { data: validRows, error: fetchError } = await supabase
+      .from("battery_rows_staging")
+      .select("*")
+      .eq("validation_status", "valid");
+
+    if (fetchError) {
+      return res.status(500).json({ error: fetchError.message });
+    }
+
+    if (!validRows || validRows.length === 0) {
+      return res.json({ promoted: 0 });
+    }
+
+    const rowsForFinal = validRows.map((row) => ({
+      bilmerke: row.bilmerke,
+      modell: row.modell,
+      fra_aar: row.fra_aar,
+      til_aar: row.til_aar,
+      motortype: row.motortype,
+      ah: row.ah,
+      cca: row.cca,
+      dimensjon: row.dimensjon,
+      polplassering: row.polplassering,
+      batteritype: row.batteritype,
+      varenummer: row.varenummer,
+      source_file_name: row.source_file_name,
+      page_number: row.page_number,
+      fingerprint: row.fingerprint,
+      imported_from_staging_id: row.id,
+    }));
+
+    const { data, error } = await supabase
+      .from("battery_rows_final")
+      .upsert(rowsForFinal, { onConflict: "fingerprint" })
+      .select("*");
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      promoted: data?.length || 0,
+      rows: data || [],
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Feil ved flytting til final-tabell",
     });
   }
 });
