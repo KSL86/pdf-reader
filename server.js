@@ -228,9 +228,20 @@ app.post("/api/extract", async (req, res) => {
     const text =
       data?.content?.map((block) => block?.text || "").join("\n").trim() || "";
 
-    const rows = tryParseJSONArray(text).map((r) =>
-      normalizeRow(r, sourceFileName)
-    );
+    let parsedRows;
+
+try {
+  parsedRows = tryParseJSONArray(text);
+} catch (parseError) {
+  return res.status(500).json({
+    error: parseError.message,
+    rawText: text
+  });
+}
+
+const rows = parsedRows.map((r) => normalizeRow(r, sourceFileName));
+
+res.json({ rows, rawText: text });
 
     res.json({ rows, rawText: text });
   } catch (error) {
