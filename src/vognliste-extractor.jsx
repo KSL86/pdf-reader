@@ -302,7 +302,14 @@ Ikke inkluder forklaringstekst.`;
           }),
         });
 
-        const data = await resp.json();
+        const raw = await resp.text();
+
+let data;
+try {
+  data = JSON.parse(raw);
+} catch {
+  throw new Error(`Lagring svarte ikke med JSON. Svar startet med: ${raw.slice(0, 300)}`);
+}
 
         if (!resp.ok) {
           throw new Error(data?.error || `Ekstrahering feilet (${resp.status})`);
