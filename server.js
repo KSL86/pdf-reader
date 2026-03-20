@@ -223,7 +223,7 @@ app.post("/api/extract", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 16000,
+        max_tokens: 32000,
         system: SYSTEM_PROMPT,
         messages: [
           {
