@@ -59,24 +59,46 @@ function normalizeRow(row, sourceFileName = "") {
 }
 
 function tryParseJSONArray(text) {
-  const trimmed = (text || "").trim();
+  const raw = String(text || "").trim();
 
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) return parsed;
-  } catch {}
-
-  const start = trimmed.indexOf("[");
-  const end = trimmed.lastIndexOf("]");
-  if (start !== -1 && end !== -1 && end > start) {
-    const candidate = trimmed.slice(start, end + 1);
-    const parsed = JSON.parse(candidate);
-    if (Array.isArray(parsed)) return parsed;
+  if (!raw) {
+    throw new Error("Modellen returnerte tomt svar");
   }
 
-  throw new Error("Klarte ikke å parse JSON-array fra modellen");
-}
+  const cleaned = raw
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.rows)) return parsed.rows;
+  } catch {}
+
+  const arrayStart = cleaned.indexOf("[");
+  const arrayEnd = cleaned.lastIndexOf("]");
+  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+    const candidate = cleaned.slice(arrayStart, arrayEnd + 1);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+
+  const objStart = cleaned.indexOf("{");
+  const objEnd = cleaned.lastIndexOf("}");
+  if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+    const candidate = cleaned.slice(objStart, objEnd + 1);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && Array.isArray(parsed.rows)) return parsed.rows;
+    } catch {}
+  }
+
+  throw new Error(`Klarte ikke å parse JSON-array fra modellen. Råsvar: ${raw.slice(0, 1000)}`);
+}
 app.get("/api/health", async (_req, res) => {
   res.json({ ok: true });
 });
